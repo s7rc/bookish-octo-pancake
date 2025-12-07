@@ -1,294 +1,239 @@
-use std::thread::JoinHandle;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::io::Result;
-use std::net::UdpSocket;
-use std::net::SocketAddr;
-use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
-use rand::Rng;
-use std::time::Duration;
+pub mod internals;
 
-use crate::protocol::*;
+use internals::*;
+use std::io::{Cursor, Result, Error, ErrorKind};
+use byteorder::{WriteBytesExt, LittleEndian};
 
-#[derive(Copy, Clone, Debug, Default)]
-struct Slot {
-  controller_info: ControllerInfo,
-  controller_data: ControllerData
+pub const PROTOCOL_VERSION: u16 = 1001;
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum MessageSource {
+  Server,
+  Client
 }
 
-struct RequestedControllerData {
-  packet_number: u32,
-  slot_numbers: HashSet<u8>,
-  mac_addresses: HashSet<u64>
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum MessageType {
+  ProtocolVersion,
+  ConnectedControllers,
+  ControllerData
 }
 
-const DEFAULT_PORT: u16 = 26760;
-
-pub trait DsServer {
-  /// Starts background server thread.
-  fn start(self, countinue_running: Arc<AtomicBool>) -> JoinHandle<()>;
-
-  /// Update controller info (it will automatically send this data to connected clients).
-  fn update_controller_info(&self, controller_info: ControllerInfo);
-
-  /// Update controller data (it will automatically send this data to connected clients).
-  fn update_controller_data(&self, slot_number: u8, controller_data: ControllerData);
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum SlotState {
+  NotConnected,
+  Reserved,
+  Connected
 }
 
-pub struct Server {
-  message_header: MessageHeader,
-  slots: Mutex<[Slot; 4]>,
-  connected_clients: Mutex<HashMap<SocketAddr, RequestedControllerData>>,
-  socket: UdpSocket,
-}
-
-impl Server {
-  /// Creates new server.
-  /// 
-  /// # Arguments
-  /// 
-  /// * `id` - server ID, pass `None` to use a random number.
-  /// * `address` - server's UDP socket address, if `None` is passed `127.0.0.1:3333` is used.
-  pub fn new(id: Option<u32>, address: Option<SocketAddr>) -> Result<Server> {
-    let mut rng = rand::thread_rng();
-
-    let server_id = match id {
-      Some(id) => id,
-      None => rng.gen()
-    };
-
-    let message_header = {
-      MessageHeader {
-        source: MessageSource::Server,
-        protocol_version: PROTOCOL_VERSION,
-        message_length: 0,
-        checksum: 0,
-        source_id: server_id
-      }
-    };
-
-    let slots = {
-      let mut slots: [Slot; 4] = [Default::default(); 4];
-      let mut i = 0;
-      for slot in slots.iter_mut() {
-        slot.controller_info.slot = i;
-        i += 1;
-      }
-
-      Mutex::new(slots)
-    };
-
-    let connected_clients = Mutex::new(HashMap::new());
-
-    let socket_address = match address {
-      Some(address) => address,
-      None => SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT))
-    };
-    let socket = UdpSocket::bind(socket_address)?;
-    socket.set_read_timeout(Some(Duration::from_secs_f64(0.2)))?;
-    socket.set_write_timeout(Some(Duration::from_secs_f64(0.2)))?;
-
-    Ok(Server {
-      message_header,
-      slots,
-      connected_clients,
-      socket
-    })
-  }
-
-  fn encode_and_send(&self, target: SocketAddr, message: Message) -> Result<()> {
-    let mut encoded_message = vec![];
-    encode_message(&mut encoded_message, message).unwrap();
-  
-    self.socket.send_to(&encoded_message, target).map(|_amount| ())
-  }
-
-  fn send_protocol_version(&self, target: SocketAddr) -> Result<()> {
-    let message = Message {
-      header: self.message_header,
-      message_type: MessageType::ConnectedControllers,
-      payload: MessagePayload::ProtocolVersion(PROTOCOL_VERSION)
-    };
-
-    self.encode_and_send(target, message)
-  }
-
-  fn send_connected_controller_info(&self, target: SocketAddr, slot_number: u8) -> Result<()> {
-    let controller_info = self.slots.lock().unwrap()[slot_number as usize].controller_info;
-
-    let payload = MessagePayload::ConnectedControllerResponse {
-      controller_info
-    };
-
-    let message = Message {
-      header: self.message_header,
-      message_type: MessageType::ConnectedControllers,
-      payload
-    };
-
-    self.encode_and_send(target, message)
-  }
-
-  fn send_slot_data(&self, target: SocketAddr, 
-                    slot: Slot, packet_number: &mut u32) -> Result<()> {
-    let payload = MessagePayload::ControllerData {
-      packet_number: *packet_number,
-      controller_info: slot.controller_info,
-      controller_data: slot.controller_data  
-    };
-
-    let message = Message {
-      header: self.message_header,
-      message_type: MessageType::ControllerData,
-      payload
-    };
-
-    let result = self.encode_and_send(target, message);
-    if result.is_ok() {
-      *packet_number += 1;
-    }
-
-    result
-  }
-
-  fn send_controller_data(&self) -> Result<()> {
-    let slots = self.slots.lock().unwrap();
-    let mut connected_clients = self.connected_clients.lock().unwrap();
-
-    connected_clients.retain(|&client_address, requested_controller_data| {
-      let mut already_sent = HashSet::new();
-
-      for &slot_number in requested_controller_data.slot_numbers.iter() {
-        let slot = slots[slot_number as usize];
-        let result = self.send_slot_data(client_address, 
-                                         slot, 
-                                         &mut requested_controller_data.packet_number);
-
-        if result.is_ok() {
-          already_sent.insert(slot_number);
-        } else {
-          return false;
-        }
-      }
-
-      for &mac_address in requested_controller_data.mac_addresses.iter() {
-        let slot_number = slots.iter().position(|slot| slot.controller_info.mac_address == mac_address);
-        if let Some(slot_number) = slot_number {
-          if !already_sent.contains(&(slot_number as u8)) {
-            let slot = slots[slot_number];
-            let result = self.send_slot_data(client_address, 
-                                             slot, 
-                                             &mut requested_controller_data.packet_number);
-
-            if result.is_ok() {
-              already_sent.insert(slot_number as u8);
-            } else {
-              return false;
-            }
-          }
-        }
-      }
-
-      true
-    });
-
-    Ok(())
-  }
-
-  fn handle_request(&self, source: SocketAddr, request: Message) -> Result<()> {
-    match request.message_type {
-      MessageType::ProtocolVersion => {
-        self.send_protocol_version(source)
-      },
-      _ => {
-        match request.payload {
-          MessagePayload::ConnectedControllersRequest { amount, 
-                                                        slot_numbers } => {
-            for i in 0..amount {
-              let slot_number = slot_numbers[i as usize];
-              self.send_connected_controller_info(source, slot_number)?;
-            }
-    
-            Ok(())
-          },
-          MessagePayload::ControllerDataRequest(request) => { 
-            {
-              let mut connected_clients = self.connected_clients.lock().unwrap();
-              let requested = connected_clients.entry(source).or_insert(RequestedControllerData {
-                packet_number: 0,
-                slot_numbers: HashSet::new(),
-                mac_addresses: HashSet::new()
-              });
-              
-              match request {
-                ControllerDataRequest::ReportAll => {
-                  requested.slot_numbers.insert(0);
-                  requested.slot_numbers.insert(1);
-                  requested.slot_numbers.insert(2);
-                  requested.slot_numbers.insert(3);
-                },
-                ControllerDataRequest::SlotNumber(slot_number) => {
-                  requested.slot_numbers.insert(slot_number);
-                },
-                ControllerDataRequest::MAC(mac) => {
-                  requested.mac_addresses.insert(mac);
-                }
-              };
-            }
-    
-            self.send_controller_data()
-          },
-          _ => Ok(()) // ignore request
-        }
-      }
-    }
+impl Default for SlotState {
+  fn default() -> SlotState {
+    SlotState::NotConnected
   }
 }
 
-impl DsServer for Arc<Server> {
-  fn start(self, countinue_running: Arc<AtomicBool>) -> JoinHandle<()> {
-    let countinue_running = countinue_running.clone();
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum DeviceType {
+  NotApplicable,
+  PartialGyro,
+  FullGyro
+}
 
-    std::thread::spawn(move || {
-      let mut buf = [0 as u8; 100];
-      while countinue_running.load(Ordering::SeqCst) {
-        match self.socket.recv_from(&mut buf) {
-          Ok((amount, source)) => {
-            let message = parse_message(MessageSource::Client, &buf[..amount], true);
-            if let Ok(message) = message {
-              let _ = self.handle_request(source, message);
-            }
-          },
-          _ => ()
-        }
-      }
-    })
+impl Default for DeviceType {
+  fn default() -> DeviceType {
+    DeviceType::NotApplicable
+  }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum ConnectionType {
+  NotApplicable,
+  USB,
+  Bluetooth
+}
+
+impl Default for ConnectionType {
+  fn default() -> ConnectionType {
+    ConnectionType::NotApplicable
+  }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum BatteryStatus {
+  NotApplicable,
+  Dying,
+  Low,
+  Medium,
+  High,
+  Full,
+  Charging,
+  Charged
+}
+
+impl Default for BatteryStatus {
+  fn default() -> BatteryStatus {
+    BatteryStatus::NotApplicable
+  }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum ControllerDataRequest {
+  ReportAll,
+  SlotNumber(u8),
+  MAC(u64)
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum MessagePayload {
+  None,
+  ProtocolVersion(u16),
+  ConnectedControllersRequest { amount: i32, 
+                                slot_numbers: [u8; 4] },
+  ConnectedControllerResponse { controller_info: ControllerInfo },
+  ControllerDataRequest(ControllerDataRequest),
+  ControllerData { packet_number: u32,
+                   controller_info: ControllerInfo,
+                   controller_data: ControllerData }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct MessageHeader {
+  pub source: MessageSource,
+  pub protocol_version: u16,
+  pub message_length: u16,
+  pub checksum: u32,
+  pub source_id: u32
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct ControllerInfo {
+  pub slot: u8,
+  pub slot_state: SlotState,
+  pub device_type: DeviceType,
+  pub connection_type: ConnectionType,
+  pub mac_address: u64,
+  pub battery_status: BatteryStatus
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct TouchData {
+  active: bool,
+  id: u8,
+  position_x: u16,
+  position_y: u16
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct ControllerData {
+  pub connected: bool,
+  pub d_pad_left: bool,
+  pub d_pad_down: bool,
+  pub d_pad_right: bool,
+  pub d_pad_up: bool,
+  pub start: bool,
+  pub right_stick_button: bool,
+  pub left_stick_button: bool,
+  pub select: bool,
+  pub square: bool,
+  pub cross: bool,
+  pub circle: bool,
+  pub triangle: bool,
+  pub r1: bool,
+  pub l1: bool,
+  pub r2: bool,
+  pub l2: bool,
+  pub ps: u8,
+  pub touch: u8,
+  pub left_stick_x: u8,
+  pub left_stick_y: u8,
+  pub right_stick_x: u8,
+  pub right_stick_y: u8,
+  pub analog_d_pad_left: u8,
+  pub analog_d_pad_down: u8,
+  pub analog_d_pad_right: u8,
+  pub analog_d_pad_up: u8,
+  pub analog_square: u8,
+  pub analog_triangle: u8,
+  pub analog_cross: u8,
+  pub analog_circle: u8,
+  pub analog_r1: u8,
+  pub analog_l1: u8,
+  pub analog_r2: u8,
+  pub analog_l2: u8,
+  pub first_touch: TouchData,
+  pub second_touch: TouchData,
+  pub motion_data_timestamp: u64,
+  pub accelerometer_x: f32,
+  pub accelerometer_y: f32,
+  pub accelerometer_z: f32,
+  pub gyroscope_pitch: f32,
+  pub gyroscope_yaw: f32,
+  pub gyroscope_roll: f32,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Message {
+  pub header: MessageHeader,
+  pub message_type: MessageType,
+  pub payload: MessagePayload
+}
+
+fn compute_checksum(packet: &[u8]) -> u32 {
+  let mut packet = packet.to_vec();
+  for byte in &mut packet[8..12] {
+      *byte = 0;
   }
 
-  fn update_controller_info(&self, controller_info: ControllerInfo) {
-    assert!(controller_info.slot < 4);
+  // FIXED: Used crc32fast::hash instead of crc::crc32::checksum_ieee
+  crc32fast::hash(&packet)
+}
 
-    let slot_number = controller_info.slot;
-    {
-      let mut slots = self.slots.lock().unwrap();
-      slots[slot_number as usize].controller_info = controller_info;
-    }
+pub fn encode_message(writer: &mut Vec<u8>, message: Message) -> Result<()> {
+  encode_message_header(writer, message.header)?;
+  encode_message_type(writer, message.message_type)?;
+  encode_message_payload(writer, message.payload)?;
 
-    let connected_clients = self.connected_clients.lock().unwrap();
-    for &address in connected_clients.keys() {
-      let _ = self.send_connected_controller_info(address, slot_number);
+  let length = (writer.len() - 16) as u16;
+  let mut length_bytes = vec![];
+  length_bytes.write_u16::<LittleEndian>(length)?;
+  writer[6..8].swap_with_slice(&mut length_bytes[..]);
+
+  let checksum = compute_checksum(writer);
+  let mut checksum_bytes = vec![];
+  checksum_bytes.write_u32::<LittleEndian>(checksum)?;
+  writer[8..12].swap_with_slice(&mut checksum_bytes[..]);
+
+  Ok(())
+}
+
+pub fn parse_message(message_source: MessageSource,
+                     packet: &[u8], 
+                     verify_checksum: bool) -> Result<Message> {
+  let mut reader = Cursor::new(packet);
+  let header = parse_message_header(&mut reader)?;
+
+  if header.protocol_version != PROTOCOL_VERSION {
+    return Err(Error::new(ErrorKind::InvalidData, "Unsupported protocol version"));
+  }
+
+  if packet.len() - 16 < header.message_length as usize {
+    return Err(Error::new(ErrorKind::InvalidData, "Received packet is too short"));
+  }
+
+  if verify_checksum {
+    let checksum = compute_checksum(packet);
+    if checksum != header.checksum {
+      return Err(Error::new(ErrorKind::InvalidData, "Packet has incorrect checksum"));
     }
   }
 
-  fn update_controller_data(&self, slot_number: u8, controller_data: ControllerData) {
-    assert!(slot_number < 4);
+  let message_type = parse_message_type(&mut reader)?;
 
-    {
-      let mut slots = self.slots.lock().unwrap();
-      slots[slot_number as usize].controller_data = controller_data;
-    }
+  let payload = parse_message_payload(&mut reader, message_source, message_type)?;
 
-    let _ = self.send_controller_data();
-  }
+  Ok(Message {
+    header,
+    message_type,
+    payload
+  })
 }
